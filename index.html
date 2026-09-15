@@ -93,6 +93,15 @@ h1.title span{color:var(--lime);}
   text-align:center;
   padding:10px 0 0 0;
 }
+.sync-status{
+  font-size:11px;
+  font-family:'Space Mono',monospace;
+  text-align:center;
+  margin-top:8px;
+  letter-spacing:0.5px;
+}
+.sync-status.live{color:var(--lime-dim);}
+.sync-status.offline{color:var(--gold);}
 
 nav.tabs{
   display:flex;
@@ -319,11 +328,12 @@ td.pts{font-family:'Space Mono',monospace;color:var(--lime);font-weight:700;}
     <h1 class="title">FIFA <span>CUP</span> MANAGER</h1>
     <div class="subtitle" id="subtitle">Register squads, run the group stage, settle it on penalties.</div>
     <div class="admin-bar" id="admin-bar"></div>
+    <div class="sync-status" id="sync-status"></div>
   </header>
 
   <nav class="tabs" id="tabs"></nav>
   <div id="app"></div>
-  <div class="footer-note">DATA IS SAVED ON THIS DEVICE/BROWSER ONLY · GROUP STAGE 3PTS WIN / 1PT DRAW</div>
+  <div class="footer-note">GROUP STAGE 3PTS WIN / 1PT DRAW</div>
 </div>
 
 <div class="modal-overlay" id="admin-modal" style="display:none;">
@@ -340,6 +350,12 @@ td.pts{font-family:'Space Mono',monospace;color:var(--lime);font-weight:700;}
     </div>
   </div>
 </div>
+
+<!-- Firebase (used for live cross-device sync — see FIREBASE_CONFIG below).
+     If you don't want live sync, you can delete these two lines and the app
+     will just fall back to saving locally in this browser only. -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
 
 <script>
 const STORAGE_KEY = 'tournament-state';
@@ -373,9 +389,69 @@ function defaultState(){
   };
 }
 
-// ---------- persistence (per browser/device via localStorage) ----------
+// ---------- persistence: Firebase Realtime Database (live sync) with a
+// localStorage cache as an instant-load fallback / offline safety net ----------
+
+// Paste the config object Firebase gives you when you register a Web App
+// (Firebase console → Project settings → your web app → SDK setup and config).
+// Until you fill this in with real values, the app just saves locally per browser.
+const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyD6k2zRkSbUX1WILTe5VwU0XEIE2LtAVCA",
+    authDomain: "fifa-cup-manager.firebaseapp.com",
+    databaseURL: "https://fifa-cup-manager-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "fifa-cup-manager",
+    storageBucket: "fifa-cup-manager.firebasestorage.app",
+    messagingSenderId: "833707139647",
+    appId: "1:833707139647:web:274d0d9e1bef80ddf3ce8a"
+  };
+
+let db = null;
+let firebaseReady = false;
+
+function setSyncStatus(mode){
+  const el = document.getElementById('sync-status');
+  if(!el) return;
+  if(mode === 'live'){
+    el.textContent = '🟢 Live sync connected — updates appear on every device instantly';
+    el.className = 'sync-status live';
+  } else {
+    el.textContent = '⚪ Local only on this device — add your Firebase config for live cross-device sync';
+    el.className = 'sync-status offline';
+  }
+}
+
+function initFirebase(){
+  const configured = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.startsWith('PASTE_');
+  if(!configured || typeof firebase === 'undefined'){
+    firebaseReady = false;
+    setSyncStatus('offline');
+    return;
+  }
+  try{
+    firebase.initializeApp(FIREBASE_CONFIG);
+    db = firebase.database();
+    firebaseReady = true;
+    setSyncStatus('live');
+    db.ref(STORAGE_KEY).on('value', snapshot => {
+      const remote = snapshot.val();
+      if(remote){
+        state = remote;
+        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+        render();
+      }
+    }, err => {
+      console.error('Firebase sync error', err);
+      setSyncStatus('offline');
+    });
+  }catch(e){
+    console.error('Firebase init failed, falling back to local-only storage.', e);
+    firebaseReady = false;
+    setSyncStatus('offline');
+  }
+}
 
 function loadState(){
+  // Instant local cache so the UI isn't blank while Firebase connects (or if it's not configured).
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
     state = raw ? JSON.parse(raw) : defaultState();
@@ -385,13 +461,17 @@ function loadState(){
   }
   isAdmin = sessionStorage.getItem(ADMIN_SESSION_KEY) === '1';
   render();
+  initFirebase();
 }
 
 function saveState(){
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }catch(e){
-    console.error('Storage error', e);
+    console.error('Local storage error', e);
+  }
+  if(firebaseReady && db){
+    db.ref(STORAGE_KEY).set(state).catch(e => console.error('Firebase save error', e));
   }
 }
 
@@ -455,14 +535,48 @@ document.getElementById('admin-modal').addEventListener('click', e => {
 
 // ---------- group / standings logic ----------
 
-function createGroups(players, size){
-  const numGroups = Math.max(1, Math.ceil(players.length / 4));
+// Picks the best number of groups for the given player count and qualifiers-per-group
+// setting: groups end up as evenly sized as possible, close to a 4-player ideal, and
+// never smaller than the number of qualifiers. Small resulting groups (<=4 players)
+// automatically get a double round-robin (each pair plays twice) so there's still a
+// decent number of matches per group.
+function computeGroupPlan(numPlayers, qualifiers){
+  qualifiers = Math.max(1, qualifiers || 1);
+  if(numPlayers <= 0) return {numGroups:0, doubleRound:false};
+
+  const candidates = [];
+  for(let g=1; g<=numPlayers; g++){
+    const base = Math.floor(numPlayers / g);
+    if(base < 2) break; // groups of 1 make no sense; larger g only makes it worse
+    const remainder = numPlayers % g;
+    if(base < qualifiers) continue; // smallest group must still have enough players to seed qualifiers
+    const avgSize = numPlayers / g;
+    const sizePenalty = Math.abs(avgSize - 4) * 2; // prefer groups close to 4 players
+    const balancePenalty = remainder > 0 ? (remainder / g) : 0; // prefer even splits
+    candidates.push({g, avgSize, score: sizePenalty + balancePenalty});
+  }
+
+  if(candidates.length === 0){
+    // No split satisfies "enough players per group" (e.g. more qualifiers requested than
+    // fit in smaller groups) — fall back to one single group.
+    return {numGroups:1, doubleRound: numPlayers <= 4};
+  }
+
+  candidates.sort((a,b) => a.score - b.score || a.g - b.g);
+  const best = candidates[0];
+  return {numGroups: best.g, doubleRound: best.avgSize <= 4};
+}
+
+function createGroups(players, qualifiers){
+  const plan = computeGroupPlan(players.length, qualifiers);
+  const numGroups = plan.numGroups;
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const groups = Array.from({length: numGroups}, (_, i) => ({
     id: 'grp_' + i,
     name: 'Group ' + String.fromCharCode(65 + i),
     playerIds: [],
-    matches: []
+    matches: [],
+    doubleRound: plan.doubleRound
   }));
   shuffled.forEach((p, idx) => groups[idx % numGroups].playerIds.push(p.id));
   groups.forEach(g => {
@@ -470,7 +584,10 @@ function createGroups(players, size){
     let m = 0;
     for(let i=0;i<ids.length;i++){
       for(let j=i+1;j<ids.length;j++){
-        g.matches.push({id: g.id+'_m'+(m++), p1: ids[i], p2: ids[j], s1: null, s2: null, played:false});
+        g.matches.push({id: g.id+'_m'+(m++), p1: ids[i], p2: ids[j], s1: null, s2: null, played:false, leg: plan.doubleRound?1:null});
+        if(plan.doubleRound){
+          g.matches.push({id: g.id+'_m'+(m++), p1: ids[j], p2: ids[i], s1: null, s2: null, played:false, leg:2});
+        }
       }
     }
   });
@@ -658,7 +775,7 @@ function renderSquads(){
     actionCard.innerHTML = `
       <h2>Start the tournament</h2>
       <p style="color:var(--text-dim);font-size:13px;margin-top:-8px;">
-        Groups of up to 4 will be created automatically and the group-stage schedule will be generated.
+        Groups are sized automatically based on player count and the qualifiers setting above (aiming for balanced groups near 4 players). Small groups (4 or fewer) automatically play a double round-robin — each opponent twice.
         ${state.players.length < 2 ? 'Add at least 2 players first.' : ''}
       </p>
       <button class="btn" id="btn-start" ${canStart?'':'disabled'}>Start tournament</button>
@@ -704,7 +821,7 @@ function onAddPlayer(){
 
 function onStartTournament(){
   if(!isAdmin || state.players.length < 2) return;
-  state.groups = createGroups(state.players, 4);
+  state.groups = createGroups(state.players, state.advancePerGroup);
   state.phase = 'groups';
   activeTab = 'groups';
   saveState(); render();
@@ -767,7 +884,7 @@ function renderGroups(){
       const p1 = getPlayer(m.p1), p2 = getPlayer(m.p2);
       const editable = state.phase === 'groups' && isAdmin;
       matchesHtml += `<div class="match-row" data-match="${g.id}:${m.id}">
-        <div class="match-teams"><span>${escapeHtml(p1.name)}</span><span class="vs">vs</span><span>${escapeHtml(p2.name)}</span></div>
+        <div class="match-teams">${m.leg ? `<span class="player-group" style="margin-right:2px;">Leg ${m.leg}</span>` : ''}<span>${escapeHtml(p1.name)}</span><span class="vs">vs</span><span>${escapeHtml(p2.name)}</span></div>
         ${m.played ?
           `<div class="score-display">${m.s1} – ${m.s2}</div>${editable ? `<button class="btn ghost" data-edit-group-match="${g.id}:${m.id}">Edit</button>` : ''}`
           : editable
@@ -783,7 +900,7 @@ function renderGroups(){
     });
     matchesHtml += `</div>`;
 
-    card.innerHTML = `<h2>${g.name}</h2>` + tableHtml + matchesHtml;
+    card.innerHTML = `<h2>${g.name}${g.doubleRound ? ' <span class="count">2 legs</span>' : ''}</h2>` + tableHtml + matchesHtml;
     grid.appendChild(card);
   });
 
