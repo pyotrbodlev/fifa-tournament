@@ -389,6 +389,23 @@ function defaultState(){
   };
 }
 
+// Firebase Realtime Database drops empty arrays / null / undefined fields when you
+// set() them (e.g. groups: [] never actually gets written), so any state read back
+// from Firebase — or an older localStorage blob saved before a field existed — can
+// be missing keys entirely. This normalizes whatever comes in so the rest of the
+// app can always assume players/groups are arrays and knockout is null-or-object.
+function normalizeState(raw){
+  const base = defaultState();
+  if(!raw || typeof raw !== 'object') return base;
+  return {
+    players: Array.isArray(raw.players) ? raw.players : base.players,
+    phase: raw.phase || base.phase,
+    advancePerGroup: raw.advancePerGroup || base.advancePerGroup,
+    groups: Array.isArray(raw.groups) ? raw.groups : base.groups,
+    knockout: raw.knockout || base.knockout
+  };
+}
+
 // ---------- persistence: Firebase Realtime Database (live sync) with a
 // localStorage cache as an instant-load fallback / offline safety net ----------
 
@@ -435,7 +452,7 @@ function initFirebase(){
     db.ref(STORAGE_KEY).on('value', snapshot => {
       const remote = snapshot.val();
       if(remote){
-        state = remote;
+        state = normalizeState(remote);
         try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
         render();
       }
@@ -454,7 +471,7 @@ function loadState(){
   // Instant local cache so the UI isn't blank while Firebase connects (or if it's not configured).
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    state = raw ? JSON.parse(raw) : defaultState();
+    state = normalizeState(raw ? JSON.parse(raw) : null);
   }catch(e){
     console.error('Storage error', e);
     state = defaultState();
@@ -753,7 +770,7 @@ function renderSquads(){
     listCard.innerHTML += `<div class="empty-state">No players yet.</div>`;
   } else {
     const groupOf = {};
-    state.groups.forEach(g => g.playerIds.forEach(id => groupOf[id] = g.name));
+    (state.groups || []).forEach(g => g.playerIds.forEach(id => groupOf[id] = g.name));
     const ul = document.createElement('ul');
     ul.className = 'player-list';
     state.players.forEach(p => {
