@@ -69,6 +69,31 @@ h1.title{
 h1.title span{color:var(--lime);}
 .subtitle{color:var(--text-dim);font-size:14px;margin-top:6px;}
 
+.admin-bar{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  gap:10px;
+  margin-top:14px;
+}
+.admin-badge{
+  font-family:'Space Mono',monospace;
+  font-size:11px;
+  letter-spacing:1px;
+  color:var(--lime);
+  background:var(--card-2);
+  border:1px solid var(--lime-dim);
+  padding:5px 12px;
+  border-radius:999px;
+}
+.viewer-note{
+  color:var(--text-dim);
+  font-size:12px;
+  font-family:'Space Mono',monospace;
+  text-align:center;
+  padding:10px 0 0 0;
+}
+
 nav.tabs{
   display:flex;
   gap:8px;
@@ -130,7 +155,7 @@ nav.tabs{
 .form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
 .field{display:flex;flex-direction:column;gap:5px;flex:1;min-width:150px;}
 .field label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text-dim);}
-input[type=text], input[type=number], select{
+input[type=text], input[type=number], input[type=password], select{
   background:var(--pitch-dark);
   border:1px solid var(--line);
   color:var(--text);
@@ -140,7 +165,7 @@ input[type=text], input[type=number], select{
   font-size:14px;
   outline:none;
 }
-input[type=text]:focus, input[type=number]:focus, select:focus{border-color:var(--lime-dim);}
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, select:focus{border-color:var(--lime-dim);}
 input[type=number]{width:64px;text-align:center;font-family:'Space Mono',monospace;}
 
 .btn{
@@ -219,6 +244,7 @@ td.pts{font-family:'Space Mono',monospace;color:var(--lime);font-weight:700;}
   padding:5px 12px;border-radius:6px;
   min-width:64px;text-align:center;
 }
+.awaiting-note{color:var(--text-dim);font-size:12px;font-family:'Space Mono',monospace;}
 .groups-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px;}
 .progress-bar{height:6px;background:var(--pitch-dark);border-radius:999px;overflow:hidden;margin:6px 0 18px 0;}
 .progress-bar-fill{height:100%;background:var(--lime);transition:width .2s ease;}
@@ -260,6 +286,25 @@ td.pts{font-family:'Space Mono',monospace;color:var(--lime);font-weight:700;}
 .penalty-note{font-size:11px;color:var(--gold);margin-top:6px;text-align:center;}
 .footer-note{text-align:center;color:var(--text-dim);font-size:11px;margin-top:30px;font-family:'Space Mono',monospace;}
 
+.modal-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(5,15,10,0.72);
+  display:flex;align-items:center;justify-content:center;
+  z-index:100;
+  padding:20px;
+}
+.modal-card{
+  background:var(--card);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  padding:26px;
+  width:100%;
+  max-width:340px;
+}
+.modal-card h2{margin-top:0;}
+.modal-error{color:var(--red);font-size:12px;margin-top:8px;min-height:16px;}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;}
+
 @media (max-width:600px){
   h1.title{font-size:30px;}
   .match-teams{flex-direction:column;align-items:flex-start;gap:2px;}
@@ -273,19 +318,50 @@ td.pts{font-family:'Space Mono',monospace;color:var(--lime);font-weight:700;}
     <div class="eyebrow">Matchday Control</div>
     <h1 class="title">FIFA <span>CUP</span> MANAGER</h1>
     <div class="subtitle" id="subtitle">Register squads, run the group stage, settle it on penalties.</div>
+    <div class="admin-bar" id="admin-bar"></div>
   </header>
 
   <nav class="tabs" id="tabs"></nav>
   <div id="app"></div>
-  <div class="footer-note">DATA IS SHARED WITH ANYONE WHO OPENS THIS APP · GROUP STAGE 3PTS WIN / 1PT DRAW</div>
+  <div class="footer-note">DATA IS SAVED ON THIS DEVICE/BROWSER ONLY · GROUP STAGE 3PTS WIN / 1PT DRAW</div>
+</div>
+
+<div class="modal-overlay" id="admin-modal" style="display:none;">
+  <div class="modal-card">
+    <h2>Admin login</h2>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" id="admin-password-input" autocomplete="current-password">
+    </div>
+    <div class="modal-error" id="admin-modal-error"></div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="admin-modal-cancel" type="button">Cancel</button>
+      <button class="btn" id="admin-modal-submit" type="button">Login</button>
+    </div>
+  </div>
 </div>
 
 <script>
 const STORAGE_KEY = 'tournament-state';
+const ADMIN_SESSION_KEY = 'tournament-admin-session';
+
+// SHA-256 hash of the admin password. Default password is "fifa2026".
+// To set your own password: open this page, open the browser console, and run:
+//   sha256Hex("your-new-password").then(console.log)
+// then paste the printed hash in here as ADMIN_PASSWORD_HASH.
+const ADMIN_PASSWORD_HASH = '18148d4b2a772eb20bd9701c3eecfea3b4e96ccf1ecbcac38ed3cddcb93cac9c';
+
 let state = null;
 let activeTab = 'squads';
+let isAdmin = false;
 
 function uid(prefix){ return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+
+async function sha256Hex(str){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+window.sha256Hex = sha256Hex; // exposed so you can generate a new password hash from the console
 
 function defaultState(){
   return {
@@ -297,25 +373,85 @@ function defaultState(){
   };
 }
 
-async function loadState(){
+// ---------- persistence (per browser/device via localStorage) ----------
+
+function loadState(){
   try{
-    const res = await window.storage.get(STORAGE_KEY, true);
-    state = res ? JSON.parse(res.value) : defaultState();
+    const raw = localStorage.getItem(STORAGE_KEY);
+    state = raw ? JSON.parse(raw) : defaultState();
   }catch(e){
+    console.error('Storage error', e);
     state = defaultState();
   }
+  isAdmin = sessionStorage.getItem(ADMIN_SESSION_KEY) === '1';
   render();
 }
 
-async function saveState(){
+function saveState(){
   try{
-    await window.storage.set(STORAGE_KEY, JSON.stringify(state), true);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }catch(e){
     console.error('Storage error', e);
   }
 }
 
 function getPlayer(id){ return state.players.find(p => p.id === id); }
+
+// ---------- admin auth ----------
+
+function openAdminModal(){
+  document.getElementById('admin-modal-error').textContent = '';
+  document.getElementById('admin-password-input').value = '';
+  document.getElementById('admin-modal').style.display = 'flex';
+  document.getElementById('admin-password-input').focus();
+}
+
+function closeAdminModal(){
+  document.getElementById('admin-modal').style.display = 'none';
+}
+
+async function attemptAdminLogin(){
+  const input = document.getElementById('admin-password-input');
+  const pwd = input.value;
+  const errEl = document.getElementById('admin-modal-error');
+  if(!pwd){ errEl.textContent = 'Enter a password.'; return; }
+  const hash = await sha256Hex(pwd);
+  if(hash === ADMIN_PASSWORD_HASH){
+    isAdmin = true;
+    sessionStorage.setItem(ADMIN_SESSION_KEY, '1');
+    closeAdminModal();
+    render();
+  } else {
+    errEl.textContent = 'Incorrect password.';
+    input.value = '';
+    input.focus();
+  }
+}
+
+function adminLogout(){
+  isAdmin = false;
+  sessionStorage.removeItem(ADMIN_SESSION_KEY);
+  render();
+}
+
+function renderAdminBar(){
+  const bar = document.getElementById('admin-bar');
+  if(!bar) return;
+  bar.innerHTML = isAdmin
+    ? `<span class="admin-badge">🔓 Admin mode</span><button class="btn ghost" id="btn-admin-logout" type="button">Logout</button>`
+    : `<button class="btn ghost" id="btn-admin-login" type="button">🔒 Admin login</button>`;
+  bar.querySelector('#btn-admin-login')?.addEventListener('click', openAdminModal);
+  bar.querySelector('#btn-admin-logout')?.addEventListener('click', adminLogout);
+}
+
+document.getElementById('admin-modal-submit').addEventListener('click', attemptAdminLogin);
+document.getElementById('admin-modal-cancel').addEventListener('click', closeAdminModal);
+document.getElementById('admin-password-input').addEventListener('keydown', e => {
+  if(e.key === 'Enter'){ e.preventDefault(); attemptAdminLogin(); }
+});
+document.getElementById('admin-modal').addEventListener('click', e => {
+  if(e.target.id === 'admin-modal') closeAdminModal();
+});
 
 // ---------- group / standings logic ----------
 
@@ -421,6 +557,7 @@ function roundLabel(matchCount){
 // ---------- rendering ----------
 
 function render(){
+  renderAdminBar();
   renderTabs();
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -454,41 +591,49 @@ function renderSquads(){
   const wrap = document.createElement('div');
 
   if(state.phase === 'registration'){
-    const regCard = document.createElement('div');
-    regCard.className = 'card';
-    regCard.innerHTML = `
-      <h2>Register a squad</h2>
-      <div class="form-row">
-        <div class="field"><label>Player name</label><input type="text" id="in-player" placeholder="e.g. Sam"></div>
-        <div class="field"><label>Team</label><input type="text" id="in-team" placeholder="e.g. Real Madrid"></div>
-        <button class="btn" id="btn-add-player">Add to tournament</button>
-      </div>
-    `;
-    wrap.appendChild(regCard);
-
-    const setupCard = document.createElement('div');
-    setupCard.className = 'card';
-    setupCard.innerHTML = `
-      <h2>Tournament setup</h2>
-      <div class="form-row">
-        <div class="field">
-          <label>Qualifiers per group (advance to knockout)</label>
-          <select id="in-advance">
-            <option value="1" ${state.advancePerGroup===1?'selected':''}>Top 1</option>
-            <option value="2" ${state.advancePerGroup===2?'selected':''}>Top 2</option>
-            <option value="3" ${state.advancePerGroup===3?'selected':''}>Top 3</option>
-          </select>
+    if(isAdmin){
+      const regCard = document.createElement('div');
+      regCard.className = 'card';
+      regCard.innerHTML = `
+        <h2>Register a squad</h2>
+        <div class="form-row">
+          <div class="field"><label>Player name</label><input type="text" id="in-player" placeholder="e.g. Sam"></div>
+          <div class="field"><label>Team</label><input type="text" id="in-team" placeholder="e.g. Real Madrid"></div>
+          <button class="btn" id="btn-add-player">Add to tournament</button>
         </div>
-      </div>
-    `;
-    wrap.appendChild(setupCard);
+      `;
+      wrap.appendChild(regCard);
+
+      const setupCard = document.createElement('div');
+      setupCard.className = 'card';
+      setupCard.innerHTML = `
+        <h2>Tournament setup</h2>
+        <div class="form-row">
+          <div class="field">
+            <label>Qualifiers per group (advance to knockout)</label>
+            <select id="in-advance">
+              <option value="1" ${state.advancePerGroup===1?'selected':''}>Top 1</option>
+              <option value="2" ${state.advancePerGroup===2?'selected':''}>Top 2</option>
+              <option value="3" ${state.advancePerGroup===3?'selected':''}>Top 3</option>
+              <option value="4" ${state.advancePerGroup===4?'selected':''}>Top 4</option>
+            </select>
+          </div>
+        </div>
+      `;
+      wrap.appendChild(setupCard);
+    } else {
+      const waitCard = document.createElement('div');
+      waitCard.className = 'card';
+      waitCard.innerHTML = `<div class="empty-state">Waiting for the admin to register players and start the tournament.</div>`;
+      wrap.appendChild(waitCard);
+    }
   }
 
   const listCard = document.createElement('div');
   listCard.className = 'card';
   listCard.innerHTML = `<h2>Registered players <span class="count">${state.players.length}</span></h2>`;
   if(state.players.length === 0){
-    listCard.innerHTML += `<div class="empty-state">No players yet. Add the first squad above.</div>`;
+    listCard.innerHTML += `<div class="empty-state">No players yet.</div>`;
   } else {
     const groupOf = {};
     state.groups.forEach(g => g.playerIds.forEach(id => groupOf[id] = g.name));
@@ -498,7 +643,7 @@ function renderSquads(){
       const li = document.createElement('li');
       li.innerHTML = `
         <span><span class="player-name">${escapeHtml(p.name)}</span><span class="player-team">${escapeHtml(p.team)}</span></span>
-        ${groupOf[p.id] ? `<span class="player-group">${groupOf[p.id]}</span>` : (state.phase==='registration' ? `<button class="btn ghost" data-remove="${p.id}">Remove</button>` : '')}
+        ${groupOf[p.id] ? `<span class="player-group">${groupOf[p.id]}</span>` : (state.phase==='registration' && isAdmin ? `<button class="btn ghost" data-remove="${p.id}">Remove</button>` : '')}
       `;
       ul.appendChild(li);
     });
@@ -506,7 +651,7 @@ function renderSquads(){
   }
   wrap.appendChild(listCard);
 
-  if(state.phase === 'registration'){
+  if(state.phase === 'registration' && isAdmin){
     const actionCard = document.createElement('div');
     actionCard.className = 'card';
     const canStart = state.players.length >= 2;
@@ -519,12 +664,12 @@ function renderSquads(){
       <button class="btn" id="btn-start" ${canStart?'':'disabled'}>Start tournament</button>
     `;
     wrap.appendChild(actionCard);
-  } else {
+  } else if(isAdmin){
     const resetCard = document.createElement('div');
     resetCard.className = 'card';
     resetCard.innerHTML = `
       <h2>Danger zone</h2>
-      <p style="color:var(--text-dim);font-size:13px;margin-top:-8px;">Resetting clears all players, groups and results for everyone.</p>
+      <p style="color:var(--text-dim);font-size:13px;margin-top:-8px;">Resetting clears all players, groups and results.</p>
       <button class="btn secondary" id="btn-reset">Reset tournament</button>
     `;
     wrap.appendChild(resetCard);
@@ -546,6 +691,7 @@ function renderSquads(){
 }
 
 function onAddPlayer(){
+  if(!isAdmin) return;
   const nameEl = document.getElementById('in-player');
   const teamEl = document.getElementById('in-team');
   const name = nameEl.value.trim();
@@ -557,7 +703,7 @@ function onAddPlayer(){
 }
 
 function onStartTournament(){
-  if(state.players.length < 2) return;
+  if(!isAdmin || state.players.length < 2) return;
   state.groups = createGroups(state.players, 4);
   state.phase = 'groups';
   activeTab = 'groups';
@@ -565,7 +711,8 @@ function onStartTournament(){
 }
 
 function onReset(){
-  if(!confirm('This clears all players, groups and results for everyone using this app. Continue?')) return;
+  if(!isAdmin) return;
+  if(!confirm('This clears all players, groups and results. Continue?')) return;
   state = defaultState();
   activeTab = 'squads';
   saveState(); render();
@@ -581,11 +728,12 @@ function renderGroups(){
   top.innerHTML = `
     <h2>Group stage progress <span class="count">${prog.played}/${prog.total} matches</span></h2>
     <div class="progress-bar"><div class="progress-bar-fill" style="width:${prog.total? (prog.played/prog.total*100):0}%"></div></div>
+    ${isAdmin ? `
     <div class="tourney-actions">
       <button class="btn" id="btn-to-knockout" ${complete && state.phase==='groups' ? '' : 'disabled'}>
         ${state.phase==='groups' ? 'Proceed to knockout stage' : 'Knockout stage started'}
       </button>
-    </div>
+    </div>` : ''}
   `;
   wrap.appendChild(top);
 
@@ -617,18 +765,19 @@ function renderGroups(){
     let matchesHtml = `<div style="margin-top:16px;">`;
     g.matches.forEach(m => {
       const p1 = getPlayer(m.p1), p2 = getPlayer(m.p2);
-      const locked = state.phase !== 'groups';
+      const editable = state.phase === 'groups' && isAdmin;
       matchesHtml += `<div class="match-row" data-match="${g.id}:${m.id}">
         <div class="match-teams"><span>${escapeHtml(p1.name)}</span><span class="vs">vs</span><span>${escapeHtml(p2.name)}</span></div>
         ${m.played ?
-          `<div class="score-display">${m.s1} – ${m.s2}</div>${!locked ? `<button class="btn ghost" data-edit-group-match="${g.id}:${m.id}">Edit</button>` : ''}`
-          :
-          `<form class="match-score-form" data-save-group-match="${g.id}:${m.id}">
-            <input type="number" min="0" step="1" class="score-input" data-role="s1" value="" ${locked?'disabled':''}>
-            <span class="vs">:</span>
-            <input type="number" min="0" step="1" class="score-input" data-role="s2" value="" ${locked?'disabled':''}>
-            <button type="submit" class="btn small" ${locked?'disabled':''}>Save</button>
-          </form>`
+          `<div class="score-display">${m.s1} – ${m.s2}</div>${editable ? `<button class="btn ghost" data-edit-group-match="${g.id}:${m.id}">Edit</button>` : ''}`
+          : editable
+          ? `<form class="match-score-form" data-save-group-match="${g.id}:${m.id}">
+              <input type="number" min="0" step="1" class="score-input" data-role="s1" value="">
+              <span class="vs">:</span>
+              <input type="number" min="0" step="1" class="score-input" data-role="s2" value="">
+              <button type="submit" class="btn small">Save</button>
+            </form>`
+          : `<span class="awaiting-note">Awaiting result</span>`
         }
       </div>`;
     });
@@ -641,7 +790,7 @@ function renderGroups(){
   wrap.appendChild(grid);
 
   wrap.querySelector('#btn-to-knockout')?.addEventListener('click', () => {
-    if(!allGroupMatchesPlayed()) return;
+    if(!isAdmin || !allGroupMatchesPlayed()) return;
     buildKnockout();
     state.phase = 'knockout';
     activeTab = 'knockout';
@@ -651,6 +800,7 @@ function renderGroups(){
   wrap.querySelectorAll('[data-save-group-match]').forEach(form => {
     form.addEventListener('submit', e => {
       e.preventDefault();
+      if(!isAdmin) return;
       const [gid, mid] = form.dataset.saveGroupMatch.split(':');
       const s1 = parseInt(form.querySelector('[data-role="s1"]').value);
       const s2 = parseInt(form.querySelector('[data-role="s2"]').value);
@@ -664,6 +814,7 @@ function renderGroups(){
 
   wrap.querySelectorAll('[data-edit-group-match]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if(!isAdmin) return;
       const [gid, mid] = btn.dataset.editGroupMatch.split(':');
       const grp = state.groups.find(g => g.id === gid);
       const match = grp.matches.find(m => m.id === mid);
@@ -721,7 +872,7 @@ function renderKnockout(){
 
       card.innerHTML = slot1 + slot2;
 
-      if(p1 && p2 && !m.played){
+      if(p1 && p2 && !m.played && isAdmin){
         const formWrap = document.createElement('div');
         formWrap.innerHTML = `
           <form class="ko-inputs" data-save-ko="${rIdx}:${m.id}">
@@ -742,7 +893,12 @@ function renderKnockout(){
           </div>
         `;
         card.appendChild(formWrap);
-      } else if(p1 && p2 && m.played){
+      } else if(p1 && p2 && !m.played && !isAdmin){
+        const note = document.createElement('div');
+        note.className = 'awaiting-note';
+        note.textContent = 'Awaiting result';
+        card.appendChild(note);
+      } else if(p1 && p2 && m.played && isAdmin){
         const editBtn = document.createElement('button');
         editBtn.className = 'btn ghost';
         editBtn.style.marginTop = '6px';
@@ -766,6 +922,7 @@ function renderKnockout(){
   wrap.querySelectorAll('[data-save-ko]').forEach(form => {
     form.addEventListener('submit', e => {
       e.preventDefault();
+      if(!isAdmin) return;
       const [rIdx, mid] = form.dataset.saveKo.split(':');
       const s1 = parseInt(form.querySelector('[data-role="s1"]').value);
       const s2 = parseInt(form.querySelector('[data-role="s2"]').value);
