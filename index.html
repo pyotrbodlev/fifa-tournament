@@ -389,21 +389,65 @@ function defaultState(){
   };
 }
 
-// Firebase Realtime Database drops empty arrays / null / undefined fields when you
-// set() them (e.g. groups: [] never actually gets written), so any state read back
-// from Firebase — or an older localStorage blob saved before a field existed — can
-// be missing keys entirely. This normalizes whatever comes in so the rest of the
-// app can always assume players/groups are arrays and knockout is null-or-object.
+// ---------- state normalization ----------
+// Firebase Realtime Database silently drops empty arrays, null fields, and
+// undefined values on write — so data read back (from Firebase OR from a stale
+// localStorage cache) can be missing keys the rest of the app assumes exist.
+// Every state object, from every source, is passed through here before use so
+// the rest of the code can rely on a consistent, complete shape.
+
+const VALID_PHASES = ['registration', 'groups', 'knockout', 'finished'];
+
 function normalizeState(raw){
   const base = defaultState();
   if(!raw || typeof raw !== 'object') return base;
+  const players = Array.isArray(raw.players)
+    ? raw.players.filter(p => p && typeof p === 'object' && p.id)
+    : base.players;
+  const groups = Array.isArray(raw.groups) ? raw.groups.map(normalizeGroup) : base.groups;
+  const knockout = normalizeKnockout(raw.knockout);
+  const phase = VALID_PHASES.includes(raw.phase) ? raw.phase : base.phase;
+  const advancePerGroup = Number.isFinite(raw.advancePerGroup) && raw.advancePerGroup > 0
+    ? raw.advancePerGroup
+    : base.advancePerGroup;
+  return { players, phase, advancePerGroup, groups, knockout };
+}
+
+function normalizeGroup(g){
+  if(!g || typeof g !== 'object'){
+    return { id: uid('grp'), name: 'Group', playerIds: [], matches: [], doubleRound: false };
+  }
   return {
-    players: Array.isArray(raw.players) ? raw.players : base.players,
-    phase: raw.phase || base.phase,
-    advancePerGroup: raw.advancePerGroup || base.advancePerGroup,
-    groups: Array.isArray(raw.groups) ? raw.groups : base.groups,
-    knockout: raw.knockout || base.knockout
+    id: g.id || uid('grp'),
+    name: g.name || 'Group',
+    playerIds: Array.isArray(g.playerIds) ? g.playerIds.filter(Boolean) : [],
+    matches: Array.isArray(g.matches) ? g.matches.map(normalizeMatch).filter(Boolean) : [],
+    doubleRound: !!g.doubleRound
   };
+}
+
+function normalizeMatch(m){
+  if(!m || typeof m !== 'object') return null;
+  return {
+    id: m.id || uid('m'),
+    p1: m.p1 || null,
+    p2: m.p2 || null,
+    s1: typeof m.s1 === 'number' ? m.s1 : null,
+    s2: typeof m.s2 === 'number' ? m.s2 : null,
+    played: !!m.played,
+    leg: m.leg || null,
+    winner: m.winner || null,
+    penaltyWinner: m.penaltyWinner || null
+  };
+}
+
+function normalizeKnockout(ko){
+  if(!ko || typeof ko !== 'object') return null;
+  const rounds = Array.isArray(ko.rounds)
+    ? ko.rounds.map(r => Array.isArray(r) ? r.map(normalizeMatch).filter(Boolean) : []).filter(r => r.length > 0)
+    : [];
+  if(rounds.length === 0) return null;
+  return { rounds, champion: ko.champion || null };
 }
 
 // ---------- persistence: Firebase Realtime Database (live sync) with a
@@ -451,11 +495,9 @@ function initFirebase(){
     setSyncStatus('live');
     db.ref(STORAGE_KEY).on('value', snapshot => {
       const remote = snapshot.val();
-      if(remote){
-        state = normalizeState(remote);
-        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
-        render();
-      }
+      state = remote ? normalizeState(remote) : defaultState();
+      try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){ console.error('Local storage error', e); }
+      render();
     }, err => {
       console.error('Firebase sync error', err);
       setSyncStatus('offline');
@@ -471,7 +513,7 @@ function loadState(){
   // Instant local cache so the UI isn't blank while Firebase connects (or if it's not configured).
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    state = normalizeState(raw ? JSON.parse(raw) : null);
+    state = raw ? normalizeState(JSON.parse(raw)) : defaultState();
   }catch(e){
     console.error('Storage error', e);
     state = defaultState();
@@ -492,7 +534,11 @@ function saveState(){
   }
 }
 
-function getPlayer(id){ return state.players.find(p => p.id === id); }
+function getPlayer(id){
+  if(!id) return null;
+  const found = state.players.find(p => p.id === id);
+  return found || { id, name: 'Unknown player', team: '—' };
+}
 
 // ---------- admin auth ----------
 
@@ -512,16 +558,21 @@ async function attemptAdminLogin(){
   const pwd = input.value;
   const errEl = document.getElementById('admin-modal-error');
   if(!pwd){ errEl.textContent = 'Enter a password.'; return; }
-  const hash = await sha256Hex(pwd);
-  if(hash === ADMIN_PASSWORD_HASH){
-    isAdmin = true;
-    sessionStorage.setItem(ADMIN_SESSION_KEY, '1');
-    closeAdminModal();
-    render();
-  } else {
-    errEl.textContent = 'Incorrect password.';
-    input.value = '';
-    input.focus();
+  try{
+    const hash = await sha256Hex(pwd);
+    if(hash === ADMIN_PASSWORD_HASH){
+      isAdmin = true;
+      sessionStorage.setItem(ADMIN_SESSION_KEY, '1');
+      closeAdminModal();
+      render();
+    } else {
+      errEl.textContent = 'Incorrect password.';
+      input.value = '';
+      input.focus();
+    }
+  }catch(e){
+    console.error('Password check failed', e);
+    errEl.textContent = 'Login isn\'t available in this browser context (try opening the page over https).';
   }
 }
 
@@ -617,6 +668,7 @@ function standingsFor(group){
   group.matches.forEach(m => {
     if(!m.played) return;
     const a = table[m.p1], b = table[m.p2];
+    if(!a || !b) return; // match references a player no longer in this group — skip rather than crash
     a.played++; b.played++;
     a.gf += m.s1; a.ga += m.s2;
     b.gf += m.s2; b.ga += m.s1;
@@ -691,19 +743,39 @@ function roundLabel(matchCount){
 // ---------- rendering ----------
 
 function render(){
-  renderAdminBar();
-  renderTabs();
-  const app = document.getElementById('app');
-  app.innerHTML = '';
-  if(activeTab === 'squads') app.appendChild(renderSquads());
-  else if(activeTab === 'groups') app.appendChild(renderGroups());
-  else if(activeTab === 'knockout') app.appendChild(renderKnockout());
+  try{
+    state = normalizeState(state); // last-resort safety net, whatever the source of `state` was
+    renderAdminBar();
+    renderTabs();
+    const app = document.getElementById('app');
+    app.innerHTML = '';
+    if(activeTab === 'squads') app.appendChild(renderSquads());
+    else if(activeTab === 'groups') app.appendChild(renderGroups());
+    else if(activeTab === 'knockout') app.appendChild(renderKnockout());
 
-  document.getElementById('subtitle').textContent =
-    state.phase === 'registration' ? 'Register squads, then kick off the tournament.' :
-    state.phase === 'groups' ? 'Group stage in progress — enter results as matches finish.' :
-    state.phase === 'knockout' ? 'Knockout stage — win or go home.' :
-    'Tournament complete.';
+    document.getElementById('subtitle').textContent =
+      state.phase === 'registration' ? 'Register squads, then kick off the tournament.' :
+      state.phase === 'groups' ? 'Group stage in progress — enter results as matches finish.' :
+      state.phase === 'knockout' ? 'Knockout stage — win or go home.' :
+      'Tournament complete.';
+  }catch(err){
+    console.error('Render error', err);
+    renderFatalError();
+  }
+}
+
+function renderFatalError(){
+  const app = document.getElementById('app');
+  if(!app) return;
+  app.innerHTML = `
+    <div class="card">
+      <h2>Something went wrong displaying the tournament</h2>
+      <div class="empty-state">
+        Try reloading the page. If it keeps happening, open the browser console for details,
+        or ask an admin to use Reset in the Squads tab.
+      </div>
+    </div>
+  `;
 }
 
 function renderTabs(){
@@ -770,7 +842,7 @@ function renderSquads(){
     listCard.innerHTML += `<div class="empty-state">No players yet.</div>`;
   } else {
     const groupOf = {};
-    (state.groups || []).forEach(g => g.playerIds.forEach(id => groupOf[id] = g.name));
+    state.groups.forEach(g => g.playerIds.forEach(id => groupOf[id] = g.name));
     const ul = document.createElement('ul');
     ul.className = 'player-list';
     state.players.forEach(p => {
@@ -940,7 +1012,8 @@ function renderGroups(){
       const s2 = parseInt(form.querySelector('[data-role="s2"]').value);
       if(isNaN(s1) || isNaN(s2) || s1<0 || s2<0){ alert('Enter valid scores for both players.'); return; }
       const grp = state.groups.find(g => g.id === gid);
-      const match = grp.matches.find(m => m.id === mid);
+      const match = grp && grp.matches.find(m => m.id === mid);
+      if(!grp || !match){ alert('This match is out of date — the view has just been refreshed.'); render(); return; }
       match.s1 = s1; match.s2 = s2; match.played = true;
       saveState(); render();
     });
@@ -951,7 +1024,8 @@ function renderGroups(){
       if(!isAdmin) return;
       const [gid, mid] = btn.dataset.editGroupMatch.split(':');
       const grp = state.groups.find(g => g.id === gid);
-      const match = grp.matches.find(m => m.id === mid);
+      const match = grp && grp.matches.find(m => m.id === mid);
+      if(!grp || !match){ render(); return; }
       match.played = false;
       saveState(); render();
     });
@@ -1061,8 +1135,9 @@ function renderKnockout(){
       const s1 = parseInt(form.querySelector('[data-role="s1"]').value);
       const s2 = parseInt(form.querySelector('[data-role="s2"]').value);
       if(isNaN(s1) || isNaN(s2) || s1<0 || s2<0){ alert('Enter valid scores for both players.'); return; }
-      const round = state.knockout.rounds[parseInt(rIdx)];
-      const match = round.find(m => m.id === mid);
+      const round = state.knockout && state.knockout.rounds[parseInt(rIdx)];
+      const match = round && round.find(m => m.id === mid);
+      if(!round || !match){ alert('This match is out of date — the view has just been refreshed.'); render(); return; }
 
       if(s1 === s2){
         const penaltyBlock = form.parentElement.querySelector(`[data-penalty-for="${rIdx}:${mid}"]`);
@@ -1100,7 +1175,12 @@ function escapeHtml(str){
   return d.innerHTML;
 }
 
-loadState();
+try{
+  loadState();
+}catch(err){
+  console.error('Startup error', err);
+  renderFatalError();
+}
 </script>
 </body>
 </html>
